@@ -66,15 +66,21 @@ var GoogleSpreadsheet = function( ss_key, auth_id, options ){
   }
 
   function renewJwtAuth(cb) {
-    auth_mode = 'jwt';
-    jwt_client.authorize(function (err, token) {
-      if (err) return cb(err);
-      self.setAuthToken({
-        type: token.token_type,
-        value: token.access_token,
-        expires: token.expiry_date
+    return new Promise((resolve,reject)=>{
+      auth_mode = 'jwt';
+      jwt_client.authorize(function (err, token) {
+        if (err) {
+          if (typeof cb === 'function') { return cb(err); }
+          return resolve(err); // we don't reject, just move on
+        }
+        self.setAuthToken({
+          type: token.token_type,
+          value: token.access_token,
+          expires: token.expiry_date
+        });
+        if (typeof cb === 'function') { return cb(); }
+        return resolve();
       });
-      cb()
     });
   }
 
@@ -107,96 +113,121 @@ var GoogleSpreadsheet = function( ss_key, auth_id, options ){
       url = GOOGLE_FEED_URL + url_params.join("/");
     }
 
-    async.series({
-      auth: function(step) {
-        if (auth_mode != 'jwt') return step();
+    function doAuth() {
+      return new Promise((resolve,reject)=>{
+        if (auth_mode != 'jwt') return resolve();
         // check if jwt token is expired
-        if (google_auth && google_auth.expires > +new Date()) return step();
-        renewJwtAuth(step);
-      },
-      request: function(result, step) {
-        if ( google_auth ) {
-          if (google_auth.type === 'Bearer') {
-            headers['Authorization'] = 'Bearer ' + google_auth.value;
-          } else {
-            headers['Authorization'] = "GoogleLogin auth=" + google_auth;
-          }
+        if (google_auth && google_auth.expires > +new Date()){ return resolve() };
+        return renewJwtAuth();
+      })
+    }
+
+    function doRequest(){
+      if ( google_auth ) {
+        if (google_auth.type === 'Bearer') {
+          headers['Authorization'] = 'Bearer ' + google_auth.value;
+        } else {
+          headers['Authorization'] = "GoogleLogin auth=" + google_auth;
         }
+      }
 
-        headers['Gdata-Version'] = '3.0';
+      headers['Gdata-Version'] = '3.0';
 
-        if ( method == 'POST' || method == 'PUT' ) {
-          headers['content-type'] = 'application/atom+xml';
-        }
+      if ( method == 'POST' || method == 'PUT' ) {
+        headers['content-type'] = 'application/atom+xml';
+      }
 
-        if (method == 'PUT' || method == 'POST' && url.indexOf('/batch') != -1) {
-          headers['If-Match'] = '*';
-        }
+      if (method == 'PUT' || method == 'POST' && url.indexOf('/batch') != -1) {
+        headers['If-Match'] = '*';
+      }
 
-        if ( method == 'GET' && query_or_data ) {
-          var query = "?" + querystring.stringify( query_or_data );
-          // replacements are needed for using structured queries on getRows
-          query = query.replace(/%3E/g,'>');
-          query = query.replace(/%3D/g,'=');
-          query = query.replace(/%3C/g,'<');
-          url += query;
-        }
+      if ( method == 'GET' && query_or_data ) {
+        var query = "?" + querystring.stringify( query_or_data );
+        // replacements are needed for using structured queries on getRows
+        query = query.replace(/%3E/g,'>');
+        query = query.replace(/%3D/g,'=');
+        query = query.replace(/%3C/g,'<');
+        url += query;
+      }
 
+      return new Promise((resolve,reject)=> {
         request( {
           url: url,
           method: method,
           headers: headers,
           body: method == 'POST' || method == 'PUT' ? query_or_data : null
         }, function(err, response, body){
+          let errResponse = null;
           if (err) {
-            return cb( err );
+            errResponse = err;
           } else if( response.statusCode === 401 ) {
-            return cb( new Error("Invalid authorization key."));
+            errResponse = new Error("Invalid authorization key.");
           } else if ( response.statusCode >= 400 ) {
             var message = _.isObject(body) ? JSON.stringify(body) : body.replace(/&quot;/g, '"');
-            return cb( new Error("HTTP error "+response.statusCode+" ("+http.STATUS_CODES[response.statusCode])+") - "+message);
+            errResponse =  new Error("HTTP error "+response.statusCode+" ("+http.STATUS_CODES[response.statusCode])+") - "+message;
           } else if ( response.statusCode === 200 && response.headers['content-type'].indexOf('text/html') >= 0 ) {
-            return cb( new Error("Sheet is private. Use authentication or make public. (see https://github.com/theoephraim/node-google-spreadsheet#a-note-on-authentication for details)"));
+            errResponse = new Error("Sheet is private. Use authentication or make public. (see https://github.com/theoephraim/node-google-spreadsheet#a-note-on-authentication for details)");
           }
 
-
+          if (errResponse){ 
+            return reject(errResponse);
+          }
+  
           if ( body ){
-            xml_parser.parseString(body, function(err, result){
-              if ( err ) return cb( err );
-              cb( null, result, body );
-            });
+            xml_parser.parseString(body, function(xml_err, result){
+              if ( xml_err ) { return reject(xml_err); }
+              return resolve(null, result, body);
+            }); 
           } else {
-            if ( err ) cb( err );
-            else cb( null, true );
+            // if ( err ) { return reject(err); }
+            return resolve(null, true);
           }
-        })
-      }
-    });
+        }); // end request
+      }); // end new Promise
+    } // end doRequest
+
+    doAuth()
+      .then(doRequest)
+      .catch(cb);
   }
 
 
 
   // public API methods
   this.getInfo = function( cb ){
-    self.makeFeedRequest( ["worksheets", ss_key], 'GET', null, function(err, data, xml) {
-      if ( err ) return cb( err );
-      if (data===true) {
-        return cb(new Error('No response to getInfo call'))
-      }
-      var ss_data = {
-        id: data.id,
-        title: data.title,
-        updated: data.updated,
-        author: data.author,
-        worksheets: []
-      }
-      var worksheets = forceArray(data.entry);
-      worksheets.forEach( function( ws_data ) {
-        ss_data.worksheets.push( new SpreadsheetWorksheet( self, ws_data ) );
+    return new Promise((resolve,reject)=>{
+      self.makeFeedRequest( ["worksheets", ss_key], 'GET', null, function(err, data, xml) {
+        if (err) {
+          if (typeof cb === 'function') { return cb(err); }
+          return reject(err);
+        }
+
+        if (data===true) {
+          let other_err = new Error('No response to getInfo call');
+          if (typeof cb === 'function') { return cb(other_err); }
+          return reject(other_err);
+        }
+
+        var ss_data = {
+          id: data.id,
+          title: data.title,
+          updated: data.updated,
+          author: data.author,
+          worksheets: []
+        }
+        var worksheets = forceArray(data.entry);
+        worksheets.forEach( function( ws_data ) {
+          ss_data.worksheets.push( new SpreadsheetWorksheet( self, ws_data ) );
+        });
+        self.info = ss_data;
+        self.worksheets = ss_data.worksheets;
+        
+        if (typeof cb === 'function') {
+          return cb( null, ss_data );
+        }
+        resolve(ss_data);
+
       });
-      self.info = ss_data;
-      self.worksheets = ss_data.worksheets;
-      cb( null, ss_data );
     });
   }
 
@@ -332,21 +363,32 @@ var GoogleSpreadsheet = function( ss_key, auth_id, options ){
     // min-row, max-row, min-col, max-col, return-empty
     var query = _.assign({}, opts);
 
+    return new Promise((resolve,reject)=>{
+      self.makeFeedRequest(["cells", ss_key, worksheet_id], 'GET', query, function (err, data, xml) {
+        if (err) {
+          if (typeof cb === 'function') { return cb(err); }
+          reject(err);
+        }
 
-    self.makeFeedRequest(["cells", ss_key, worksheet_id], 'GET', query, function (err, data, xml) {
-      if (err) return cb(err);
-      if (data===true) {
-        return cb(new Error('No response to getCells call'))
-      }
+        if (data===true) {
+          let other_err = new Error('No response to getCells call');
+          if (typeof cb === 'function') { return cb(other_err); }
+          reject(other_err);
+        }
 
-      var cells = [];
-      var entries = forceArray(data['entry']);
-      var i = 0;
-      entries.forEach(function( cell_data ){
-        cells.push( new SpreadsheetCell( self, worksheet_id, cell_data ) );
+        var cells = [];
+        var entries = forceArray(data['entry']);
+        var i = 0;
+        entries.forEach(function( cell_data ){
+          cells.push( new SpreadsheetCell( self, worksheet_id, cell_data ) );
+        });
+
+        if (typeof cb === 'function') {
+          return cb( null, cells );
+        }
+        resolve( cells );
       });
 
-      cb( null, cells );
     });
   }
 };
